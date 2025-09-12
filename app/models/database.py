@@ -77,3 +77,4 @@ class ValidationResult(SQLModel, table=True):
     # Raw data for debugging
     raw_scraped_data: Optional[dict] = Field(default=None, sa_column=Column(JSON))
     raw_llm_response: Optional[dict] = Field(default=None, sa_column=Column(JSON))
+    raw_ocr_response: Optional[dict] = Field(default=None, sa_column=Column(JSON))

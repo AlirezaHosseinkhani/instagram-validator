@@ -32,7 +32,6 @@ validation_service = ValidationService()
 
 @router.post("/submit", response_model=SubmissionResponse)
 async def submit_content(
-    background_tasks: BackgroundTasks,
     instagram_url: str = Form(..., description="Instagram post/story/reel URL"),
     content_type: ContentType = Form(..., description="Type of Instagram content"),
     screenshot: UploadFile = File(..., description="Screenshot of the Instagram content"),
@@ -46,8 +45,7 @@ async def submit_content(
     - Content type specification
     - Screenshot file showing the content
 
-    Returns submission ID and initial status.
-    Validation runs in background.
+    Returns complete validation results immediately.
     """
     try:
         # Validate file
@@ -72,19 +70,26 @@ async def submit_content(
         session.commit()
         session.refresh(submission)
 
-        # Start validation in background
-        background_tasks.add_task(
-            run_validation_task,
-            submission.id
-        )
-
         logger.info(f"New submission created: {submission.id}")
+
+        # Run validation immediately (not in background)
+        validation_result = await validation_service.validate_submission(submission.id)
+
+        # Get updated submission data
+        session.refresh(submission)
 
         return SubmissionResponse(
             id=submission.id,
             status=submission.validation_status,
-            message="Submission received. Validation in progress.",
-            created_at=submission.created_at
+            message="ontent validation failed. Some requirements not met",
+            created_at=submission.created_at,
+            url_username=submission.url_username,
+            content_username=submission.content_username,
+            username_match=submission.username_match,
+            extracted_hashtags=submission.extracted_hashtags,
+            hashtags_valid=submission.hashtags_valid,
+            missing_hashtags=submission.missing_hashtags,
+            is_account_public=submission.is_account_public
         )
 
     except HTTPException:
@@ -93,12 +98,16 @@ async def submit_content(
         logger.error(f"Submission failed: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-async def run_validation_task(submission_id: int):
-    """Background task to run validation."""
-    try:
-        await validation_service.validate_submission(submission_id)
-    except Exception as e:
-        logger.error(f"Background validation failed for submission {submission_id}: {str(e)}")
+
+def _get_status_message(status: ValidationStatus) -> str:
+    """Get appropriate message for validation status."""
+    messages = {
+        ValidationStatus.VALID: "Content validation successful. All requirements met.",
+        ValidationStatus.INVALID: "Content validation failed. Some requirements not met.",
+        ValidationStatus.ERROR: "Validation error occurred. Please try again.",
+        ValidationStatus.PENDING: "Validation in progress..."
+    }
+    return messages.get(status, "Unknown status")
 
 @router.get("/submission/{submission_id}", response_model=SubmissionResponse)
 async def get_submission_status(
@@ -116,7 +125,7 @@ async def get_submission_status(
 
     return SubmissionResponse(
         id=submission.id,
-        status=submission.validation_status,
+        status=submission.validation_status.value,
         message=_get_status_message(submission),
         created_at=submission.created_at,
         url_username=submission.url_username,
@@ -204,10 +213,10 @@ async def revalidate_submission(
     session.commit()
 
     # Start validation in background
-    background_tasks.add_task(
-        run_validation_task,
-        submission_id
-    )
+    # background_tasks.add_task(
+    #     run_validation_task,
+    #     submission_id
+    # )
 
     return {"message": "Revalidation started", "submission_id": submission_id}
 

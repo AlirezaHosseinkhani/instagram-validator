@@ -76,20 +76,36 @@ class OpenAIAnalyzer:
         except Exception as e:
             raise OpenAIAnalysisError(f"Failed to analyze screenshot: {str(e)}")
 
-    async def _encode_image_to_base64(self, image_path: str) -> str:
-        """Encode image file to base64."""
+    async def _encode_image_to_base64(self, image_path: str, max_width: int = 800) -> str:
+        """Encode and resize image to reduce token usage."""
         try:
-            import aiofiles
+            from PIL import Image
+            import io
+
+            # Open and resize image
+            with Image.open(image_path) as img:
+                # Calculate new dimensions maintaining aspect ratio
+                if img.width > max_width:
+                    ratio = max_width / img.width
+                    new_height = int(img.height * ratio)
+                    img = img.resize((max_width, new_height), Image.LANCZOS)
+
+                # Convert to JPEG with optimized quality
+                buffer = io.BytesIO()
+                img.save(buffer, format='JPEG', quality=85, optimize=True)
+                image_data = buffer.getvalue()
+
+            return base64.b64encode(image_data).decode('utf-8')
+        except Exception as e:
+            # Fallback to original method
             async with aiofiles.open(image_path, "rb") as image_file:
                 image_data = await image_file.read()
                 return base64.b64encode(image_data).decode('utf-8')
-        except Exception as e:
-            raise OpenAIAnalysisError(f"Failed to encode image: {str(e)}")
 
     def _create_analysis_prompt(self, expected_content_type: ContentType) -> str:
         """Create analysis prompt for OpenAI."""
         return f"""
-        You are analyzing an Instagram screenshot. Please extract the following information and return it as a JSON object:
+        You are analyzing an Instagram screenshot. extract the following information and return it as a JSON object:
 
         1. **username**: The Instagram username (without @ symbol)
         2. **hashtags**: All hashtags visible in the content (as an array of strings, including the # symbol)
@@ -99,10 +115,8 @@ class OpenAIAnalyzer:
         Expected content type from user: {expected_content_type.value}
 
         **Important Instructions:**
-        - Look for the username in the header area of the Instagram interface
-        - Extract ALL visible hashtags from the caption or text
-        - Hashtags should include the # symbol (e.g., "#hashtag")
-        - Be very careful with username extraction - it's usually at the top of the post
+        - Look for the username in the header area of the Instagram interface it's usually at the top of the post
+        - Extract ALL visible hashtags from the caption or text and should include the # symbol (e.g., "#hashtag")
         - If you cannot clearly see certain information, set confidence lower
         - Return ONLY a valid JSON object, no additional text
 
