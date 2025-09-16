@@ -5,6 +5,8 @@ Service for analyzing Instagram screenshots using OpenAI GPT-4 Vision.
 import json
 import base64
 from typing import Optional, Dict, Any
+
+import aiofiles
 import openai
 from openai import AsyncOpenAI
 from app.config import settings

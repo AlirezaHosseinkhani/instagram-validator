@@ -54,7 +54,7 @@ class ValidationService:
             # Create validation result record
             validation_result = ValidationResult(submission_id=submission_id)
 
-            # Step 1: Extract content data (try instaloader -> OCR -> LLM)
+            # Step 1: Extract content data (try OCR -> LLM)
             extracted_data, extraction_success = await self._extract_content_data(
                 submission, validation_result
             )
@@ -74,6 +74,27 @@ class ValidationService:
             )
             submission.hashtags_valid = hashtags_valid
             submission.missing_hashtags = missing_hashtags
+
+            # Fall back to LLM if hashtags validation fails
+            if not hashtags_valid:
+                logger.info("Hashtag validation failed, falling back to LLM for extraction.")
+                extracted_data, extraction_success = await self._extract_with_llm(submission, validation_result)
+
+                if extracted_data:
+                    submission.content_username = extracted_data.username
+                    submission.extracted_hashtags = extracted_data.hashtags
+                    submission.extracted_data = {
+                        "content_type": extracted_data.content_type.value if extracted_data.content_type else None,
+                        "confidence": extracted_data.confidence,
+                        "extraction_method": extracted_data.extraction_method
+                    }
+
+                    # Validate hashtags again
+                    hashtags_valid, missing_hashtags, hashtag_validation_success = self._validate_hashtags(
+                        extracted_data.hashtags if extracted_data else [], validation_result
+                    )
+                    submission.hashtags_valid = hashtags_valid
+                    submission.missing_hashtags = missing_hashtags
 
             # Determine overall validation status
             overall_success = extraction_success and hashtag_validation_success
@@ -121,29 +142,12 @@ class ValidationService:
     async def _extract_content_data(self, submission: Submission,
                                     validation_result: ValidationResult) -> Tuple[Optional[ExtractedData], bool]:
         """
-        Extract content data using three-tier approach: Instaloader -> OCR -> LLM.
+        Extract content data using two-tier approach: OCR -> LLM.
         """
         try:
             extracted_data = None
 
-            # Step 1: Try Instaloader method first
-            try:
-                extracted_data = await self.scraper.scrape_post_data(submission.instagram_url)
-                if extracted_data:
-                    validation_result.extraction_method = "instaloader_shortcode"
-                    validation_result.raw_scraped_data = {
-                        "username": extracted_data.username,
-                        "hashtags": extracted_data.hashtags,
-                        "content_type": extracted_data.content_type.value if extracted_data.content_type else None
-                    }
-                    logger.info("Successfully extracted data via Instaloader shortcode method")
-                    validation_result.content_extraction_success = True
-                    validation_result.extraction_confidence = extracted_data.confidence
-                    return extracted_data, True
-            except Exception as e:
-                logger.warning(f"Instaloader extraction failed: {str(e)}")
-
-            # Step 2: Try OCR method if Instaloader failed
+            # Step 1: Try OCR method first
             try:
                 extracted_data = await self.ocr_service.analyze_screenshot_with_ocr(
                     submission.screenshot_path,
@@ -165,33 +169,37 @@ class ValidationService:
             except Exception as e:
                 logger.warning(f"OCR extraction failed: {str(e)}")
 
-            # Step 3: Fall back to LLM analysis if both Instaloader and OCR failed
-            try:
-                extracted_data = await self.analyzer.analyze_screenshot(
-                    submission.screenshot_path,
-                    submission.content_type
-                )
-                validation_result.extraction_method = "llm"
-                validation_result.raw_llm_response = {
-                    "username": extracted_data.username,
-                    "hashtags": extracted_data.hashtags,
-                    "content_type": extracted_data.content_type.value if extracted_data.content_type else None,
-                    "confidence": extracted_data.confidence
-                }
-                logger.info("Successfully extracted data via LLM analysis")
-                validation_result.content_extraction_success = True
-                validation_result.extraction_confidence = extracted_data.confidence
-                return extracted_data, True
-            except Exception as e:
-                logger.error(f"LLM extraction also failed: {str(e)}")
-
-            # If all methods failed
-            logger.error("All extraction methods (Instaloader, OCR, LLM) failed")
-            validation_result.content_extraction_success = False
-            return None, False
+            # Step 2: Fall back to LLM analysis if OCR failed
+            return await self._extract_with_llm(submission, validation_result)
 
         except Exception as e:
             logger.error(f"Content extraction failed: {str(e)}")
+            validation_result.content_extraction_success = False
+            return None, False
+
+    async def _extract_with_llm(self, submission: Submission,
+                                validation_result: ValidationResult) -> Tuple[Optional[ExtractedData], bool]:
+        """
+        Extract content data using LLM.
+        """
+        try:
+            extracted_data = await self.analyzer.analyze_screenshot(
+                submission.screenshot_path,
+                submission.content_type
+            )
+            validation_result.extraction_method = "llm"
+            validation_result.raw_llm_response = {
+                "username": extracted_data.username,
+                "hashtags": extracted_data.hashtags,
+                "content_type": extracted_data.content_type.value if extracted_data.content_type else None,
+                "confidence": extracted_data.confidence
+            }
+            logger.info("Successfully extracted data via LLM analysis")
+            validation_result.content_extraction_success = True
+            validation_result.extraction_confidence = extracted_data.confidence
+            return extracted_data, True
+        except Exception as e:
+            logger.error(f"LLM extraction failed: {str(e)}")
             validation_result.content_extraction_success = False
             return None, False
 
@@ -224,58 +232,3 @@ class ValidationService:
             logger.error(f"Hashtag validation failed: {str(e)}")
             validation_result.hashtag_validation_success = False
             return False, [], False
-
-    async def get_validation_stats(self) -> Dict[str, Any]:
-        """Get validation statistics."""
-        session_gen = get_session()
-        session = next(session_gen)
-
-        try:
-            # Count submissions by status
-            total_count = session.exec(select(func.count(Submission.id))).first()
-            valid_count = session.exec(
-                select(func.count(Submission.id)).where(Submission.validation_status == ValidationStatus.VALID)
-            ).first()
-            invalid_count = session.exec(
-                select(func.count(Submission.id)).where(Submission.validation_status == ValidationStatus.INVALID)
-            ).first()
-            pending_count = session.exec(
-                select(func.count(Submission.id)).where(Submission.validation_status == ValidationStatus.PENDING)
-            ).first()
-            error_count = session.exec(
-                select(func.count(Submission.id)).where(Submission.validation_status == ValidationStatus.ERROR)
-            ).first()
-
-            # Calculate success rate
-            processed_count = total_count - pending_count
-            success_rate = (valid_count / processed_count * 100) if processed_count > 0 else 0
-
-            # Get extraction method statistics
-            extraction_stats = await self._get_extraction_method_stats(session)
-
-            return {
-                "total_submissions": total_count,
-                "valid_submissions": valid_count,
-                "invalid_submissions": invalid_count,
-                "pending_submissions": pending_count,
-                "error_submissions": error_count,
-                "success_rate": round(success_rate, 2),
-                "extraction_methods": extraction_stats
-            }
-
-        finally:
-            session.close()
-
-    async def _get_extraction_method_stats(self, session: Session) -> Dict[str, int]:
-        """Get statistics on extraction methods used."""
-        try:
-            # This would require adding extraction_method field to Submission model
-            # For now, return placeholder data
-            return {
-                "instaloader": 0,
-                "ocr": 0,
-                "llm": 0
-            }
-        except Exception as e:
-            logger.warning(f"Failed to get extraction method stats: {str(e)}")
-            return {}
